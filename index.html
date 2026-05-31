@@ -1,714 +1,194 @@
-<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Drohnen Steuerung</title>
-<style>
-  *, *::before, *::after {
-    box-sizing: border-box;
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-touch-callout: none;
-    -webkit-tap-highlight-color: transparent;
-    touch-action: manipulation;
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+// ── WLAN Zugangsdaten ─────────────────────────────────────────────────────
+const char* SSID = "FRITZ!Box 4040 EE";      // ← anpassen
+const char* PASS = "89243552272146594014";  // ← anpassen
+
+// ── Motor Pins ────────────────────────────────────────────────────────────
+const int MOTOR1 = 12;  // Vorne Links
+const int MOTOR2 = 13;  // Vorne Rechts
+const int MOTOR3 = 14;  // Hinten Links
+const int MOTOR4 = 15;  // Hinten Rechts
+
+// ── Geschwindigkeiten ─────────────────────────────────────────────────────
+#define BASE_SPEED   180
+#define HOVER_SPEED  140
+#define TURN_DIFF     40
+
+// ── Timeout ───────────────────────────────────────────────────────────────
+#define CMD_TIMEOUT_MS 300
+
+// ── State ─────────────────────────────────────────────────────────────────
+bool motorsEnabled    = false;
+unsigned long lastCmdTime = 0;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// ── Hilfsfunktionen ───────────────────────────────────────────────────────
+void setMotor(int pin, int speed) {
+  analogWrite(pin, constrain(speed, 0, 255));
+}
+
+void allMotorsOff() {
+  setMotor(MOTOR1, 0);
+  setMotor(MOTOR2, 0);
+  setMotor(MOTOR3, 0);
+  setMotor(MOTOR4, 0);
+}
+
+// ── Bewegungsfunktionen ───────────────────────────────────────────────────
+void cmdForward() {
+  setMotor(MOTOR1, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR2, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR3, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR4, BASE_SPEED - TURN_DIFF);
+}
+
+void cmdBack() {
+  setMotor(MOTOR1, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR2, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR3, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR4, BASE_SPEED + TURN_DIFF);
+}
+
+void cmdLeft() {
+  setMotor(MOTOR1, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR2, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR3, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR4, BASE_SPEED + TURN_DIFF);
+}
+
+void cmdRight() {
+  setMotor(MOTOR1, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR2, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR3, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR4, BASE_SPEED - TURN_DIFF);
+}
+
+void cmdUp() {
+  int spd = constrain(BASE_SPEED + 30, 0, 255);
+  setMotor(MOTOR1, spd); setMotor(MOTOR2, spd);
+  setMotor(MOTOR3, spd); setMotor(MOTOR4, spd);
+}
+
+void cmdDown() {
+  int spd = constrain(BASE_SPEED - 30, 0, 255);
+  setMotor(MOTOR1, spd); setMotor(MOTOR2, spd);
+  setMotor(MOTOR3, spd); setMotor(MOTOR4, spd);
+}
+
+void cmdRotLeft() {
+  setMotor(MOTOR1, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR2, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR3, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR4, BASE_SPEED + TURN_DIFF);
+}
+
+void cmdRotRight() {
+  setMotor(MOTOR1, BASE_SPEED - TURN_DIFF);
+  setMotor(MOTOR2, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR3, BASE_SPEED + TURN_DIFF);
+  setMotor(MOTOR4, BASE_SPEED - TURN_DIFF);
+}
+
+// ── Befehl verarbeiten ────────────────────────────────────────────────────
+void processCommand(String cmd) {
+  cmd.trim();
+  lastCmdTime = millis();
+
+  if (cmd == "MOTORS_ON") {
+    motorsEnabled = true;
+    // Motoren bleiben aus – starten erst beim ersten Steuerbefehl
+    ws.textAll("STATUS:MOTORS_ON");
+    ws.textAll("OK:Motoren bereit");
+    return;
   }
 
-  :root {
-    --bg:     #0c0e14;
-    --bg2:    #161a26;
-    --bg3:    #1d2235;
-    --border: rgba(255,255,255,0.07);
-    --text:   #dde2ee;
-    --dim:    #707b93;
-    --accent: #3b82f6;
-    --aglow:  rgba(59,130,246,0.4);
-    --green:  #22c55e;
-    --gglow:  rgba(34,197,94,0.3);
-    --red:    #ef4444;
-    --rglow:  rgba(239,68,68,0.3);
-    --yellow: #f59e0b;
-    --font:   'Courier New', Courier, monospace;
-    --bs: clamp(52px, 10vw, 76px);
-    --r: 12px;
+  if (cmd == "MOTORS_OFF" || cmd == "STOP") {
+    if (cmd == "MOTORS_OFF") motorsEnabled = false;
+    allMotorsOff();
+    ws.textAll("STATUS:MOTORS_OFF");
+    ws.textAll("OK:Gestoppt");
+    return;
   }
 
-  html, body {
-    margin: 0; padding: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font);
-    height: 100dvh;
-    overflow: hidden;
+  if (!motorsEnabled) {
+    ws.textAll("ERR:Motoren nicht aktiv");
+    return;
   }
 
-  /* Portrait warning */
-  .portrait-warn {
-    display: none;
-    position: fixed; inset: 0;
-    background: var(--bg);
-    z-index: 999;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 16px;
-    text-align: center;
-    padding: 30px;
+  if      (cmd == "FWD")  { cmdForward();  ws.textAll("OK:Vorwaerts"); }
+  else if (cmd == "BACK") { cmdBack();     ws.textAll("OK:Rueckwaerts"); }
+  else if (cmd == "LEFT") { cmdLeft();     ws.textAll("OK:Links"); }
+  else if (cmd == "RIGHT"){ cmdRight();    ws.textAll("OK:Rechts"); }
+  else if (cmd == "UP")   { cmdUp();       ws.textAll("OK:Steigen"); }
+  else if (cmd == "DOWN") { cmdDown();     ws.textAll("OK:Sinken"); }
+  else if (cmd == "ROTL") { cmdRotLeft();  ws.textAll("OK:Drehen_L"); }
+  else if (cmd == "ROTR") { cmdRotRight(); ws.textAll("OK:Drehen_R"); }
+  else {
+    ws.textAll("ERR:Unbekannter_Befehl:" + cmd);
   }
-  .portrait-warn .icon { font-size: 52px; animation: rot-hint 2.4s ease-in-out infinite; }
-  @keyframes rot-hint {
-    0%,30%,100% { transform: rotate(0deg); }
-    55%,85%     { transform: rotate(90deg); }
+}
+
+// ── WebSocket Event Handler ───────────────────────────────────────────────
+void onWsEvent(AsyncWebSocket* s, AsyncWebSocketClient* c,
+               AwsEventType t, void* arg, uint8_t* data, size_t len) {
+  if (t == WS_EVT_CONNECT) {
+    Serial.printf("WS Client verbunden: %u\n", c->id());
+    ws.textAll("SYS:Drohnen-Controller bereit");
+  } else if (t == WS_EVT_DISCONNECT) {
+    Serial.printf("WS Client getrennt: %u\n", c->id());
+    allMotorsOff();
+    motorsEnabled = false;
+  } else if (t == WS_EVT_DATA) {
+    String cmd = "";
+    for (size_t i = 0; i < len; i++) cmd += (char)data[i];
+    Serial.println("CMD: " + cmd);
+    processCommand(cmd);
   }
-  .portrait-warn strong { color: var(--text); font-size: 15px; letter-spacing: 0.08em; display: block; }
-  .portrait-warn p { color: var(--dim); font-size: 13px; letter-spacing: 0.04em; margin: 0; }
+}
 
-  @media (orientation: portrait) {
-    .portrait-warn { display: flex; }
-    .app { display: none !important; }
+// ── Setup ─────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MOTOR1, OUTPUT);
+  pinMode(MOTOR2, OUTPUT);
+  pinMode(MOTOR3, OUTPUT);
+  pinMode(MOTOR4, OUTPUT);
+  allMotorsOff();
+
+  // Fixe IP
+  IPAddress ip(192, 168, 1, 100);
+  IPAddress gateway(192, 168, 1, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.config(ip, gateway, subnet);
+
+  // WLAN verbinden
+  WiFi.begin(SSID, PASS);
+  Serial.print("Verbinde mit WLAN");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
   }
+  Serial.println("\nVerbunden! IP: " + WiFi.localIP().toString());
 
-  /* App shell */
-  .app {
-    height: 100dvh;
-    display: flex;
-    flex-direction: column;
-    padding: 5px 8px;
-    gap: 5px;
+  // WebSocket
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.begin();
+  Serial.println("WebSocket Server gestartet auf ws://" + WiFi.localIP().toString() + "/ws");
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────
+void loop() {
+  ws.cleanupClients();
+
+  // Timeout: Motoren aus wenn kein Befehl
+  if (motorsEnabled && (millis() - lastCmdTime) > CMD_TIMEOUT_MS) {
+    allMotorsOff();
   }
-
-  /* Status bar */
-  .status-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 4px 12px;
-    background: var(--bg2);
-    border-radius: var(--r);
-    border: 1px solid var(--border);
-    flex-shrink: 0;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .s-item { display: flex; align-items: center; gap: 5px; }
-  .s-label { font-size: 9px; color: var(--dim); letter-spacing: 0.08em; text-transform: uppercase; }
-  .s-val { font-size: 11px; font-weight: 700; }
-  .s-val.ok   { color: var(--green); }
-  .s-val.warn { color: var(--yellow); }
-  .s-val.err  { color: var(--red); }
-  .conn-dot {
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--red);
-    box-shadow: 0 0 6px var(--rglow);
-    transition: background 0.3s, box-shadow 0.3s;
-  }
-  .conn-dot.connected {
-    background: var(--green);
-    box-shadow: 0 0 6px var(--gglow);
-    animation: pulse 2s infinite;
-  }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
-  .sep { width: 1px; height: 14px; background: var(--border); }
-
-  /* Connect button in status bar */
-  .connect-btn {
-    padding: 4px 12px;
-    border-radius: 8px;
-    border: 1.5px solid rgba(59,130,246,0.4);
-    background: linear-gradient(145deg, #1a2240, #111828);
-    color: #93c5fd;
-    font-family: var(--font);
-    font-size: 10px; font-weight: 700;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  .connect-btn:hover { border-color: var(--accent); box-shadow: 0 0 12px var(--aglow); }
-  .connect-btn.connected {
-    border-color: rgba(239,68,68,0.4);
-    color: #fca5a5;
-  }
-  .connect-btn.connected:hover { border-color: var(--red); box-shadow: 0 0 12px var(--rglow); }
-
-  /* IP input */
-  .ip-input {
-    background: var(--bg3);
-    border: 1.5px solid rgba(59,130,246,0.3);
-    border-radius: 8px;
-    color: var(--text);
-    font-family: var(--font);
-    font-size: 10px;
-    padding: 4px 8px;
-    width: 130px;
-    outline: none;
-    letter-spacing: 0.05em;
-  }
-  .ip-input:focus { border-color: var(--accent); }
-
-  /* Main grid */
-  .main {
-    flex: 1;
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 8px;
-    align-items: center;
-    min-height: 0;
-  }
-
-  /* Side panels */
-  .left-panel, .right-panel {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 5px;
-  }
-  .panel-label { font-size: 9px; color: var(--dim); letter-spacing: 0.08em; text-transform: uppercase; }
-  .vsep { width: 55%; height: 1px; background: var(--border); }
-  .rot-row { display: flex; gap: 5px; }
-
-  /* Buttons */
-  .btn {
-    width: var(--bs);
-    height: var(--bs);
-    border-radius: var(--r);
-    border: 1.5px solid rgba(59,130,246,0.28);
-    background: linear-gradient(145deg, #1a2240, #111828);
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer;
-    font-size: clamp(17px, 3.8vw, 26px);
-    color: #93c5fd;
-    position: relative; overflow: hidden;
-    transition: border-color 0.08s, box-shadow 0.08s, transform 0.07s, background 0.08s;
-    touch-action: none;
-    box-shadow: 0 0 8px rgba(59,130,246,0.1), inset 0 1px 0 rgba(255,255,255,0.04);
-  }
-  .btn::after {
-    content: '';
-    position: absolute; inset: 0;
-    background: radial-gradient(circle at center, rgba(147,197,253,0.2), transparent 70%);
-    opacity: 0;
-    transition: opacity 0.08s;
-  }
-  .btn.pressed {
-    background: linear-gradient(145deg, #2a4a80, #1e3060);
-    border-color: var(--accent);
-    box-shadow: 0 0 24px var(--aglow), inset 0 0 14px rgba(59,130,246,0.22);
-    transform: scale(0.87);
-    color: #e0f0ff;
-  }
-  .btn.pressed::after { opacity: 1; }
-
-  .btn:disabled, .btn.disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-    pointer-events: none;
-  }
-
-  .btn.tall { height: calc(var(--bs) * 1.3); }
-  .btn.sm {
-    width:  calc(var(--bs) * 0.76);
-    height: calc(var(--bs) * 0.76);
-    font-size: clamp(15px, 3.2vw, 21px);
-  }
-
-  /* D-pad */
-  .dpad {
-    display: grid;
-    grid-template-columns: repeat(3, var(--bs));
-    grid-template-rows: repeat(3, var(--bs));
-    gap: 5px;
-  }
-  .ghost {
-    display: flex; align-items: center; justify-content: center;
-    pointer-events: none;
-  }
-  .stop-lbl { font-size: 8px; color: var(--dim); letter-spacing: 0.06em; }
-
-  /* Center */
-  .center-panel {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 7px;
-    padding: 0 4px;
-  }
-
-  /* Telemetry */
-  .tele {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 6px;
-    width: 100%;
-  }
-  .tele-card {
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    padding: 7px 5px 5px;
-    text-align: center;
-    position: relative; overflow: hidden;
-  }
-  .tele-card::before {
-    content: '';
-    position: absolute; top: 0; left: 0; right: 0; height: 2px;
-    background: linear-gradient(90deg, transparent, var(--accent), transparent);
-    opacity: 0.4;
-  }
-  .tele-val { font-size: clamp(12px, 2.5vw, 17px); font-weight: 700; color: var(--text); }
-  .tele-key { font-size: 8px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 1px; }
-
-  /* Shutdown */
-  .shutdown-btn {
-    width: 100%; padding: 10px 0;
-    border-radius: var(--r);
-    border: 1.5px solid rgba(239,68,68,0.32);
-    background: linear-gradient(145deg, #2a1515, #180d0d);
-    color: #fca5a5;
-    font-family: var(--font);
-    font-size: 11px; font-weight: 700;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    cursor: pointer;
-    display: flex; align-items: center; justify-content: center; gap: 7px;
-    transition: all 0.1s;
-    touch-action: none;
-    box-shadow: 0 0 8px rgba(239,68,68,0.07);
-  }
-  .shutdown-btn.on {
-    border-color: var(--red);
-    color: #ef4444;
-    box-shadow: 0 0 18px var(--rglow);
-    background: linear-gradient(145deg, #3d1010, #250808);
-  }
-  .shutdown-btn:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-    pointer-events: none;
-  }
-  .stop-sq { width: 10px; height: 10px; background: currentColor; border-radius: 2px; flex-shrink: 0; }
-
-  /* Console */
-  .console-wrap {
-    width: 100%;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    overflow: hidden;
-  }
-  .console-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 4px 8px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg3);
-  }
-  .console-title {
-    font-size: 8px; color: var(--dim);
-    letter-spacing: 0.1em; text-transform: uppercase;
-  }
-  .console-clear {
-    font-size: 8px; color: var(--dim);
-    background: none; border: none;
-    cursor: pointer; font-family: var(--font);
-    letter-spacing: 0.06em;
-    padding: 0;
-  }
-  .console-clear:hover { color: var(--text); }
-  .console-log {
-    height: 52px;
-    overflow-y: auto;
-    padding: 4px 8px;
-    font-size: 9px;
-    line-height: 1.5;
-    scrollbar-width: none;
-  }
-  .console-log::-webkit-scrollbar { display: none; }
-  .log-line { color: var(--dim); }
-  .log-line.tx { color: #60a5fa; }
-  .log-line.rx { color: var(--green); }
-  .log-line.err { color: var(--red); }
-  .log-line.sys { color: var(--yellow); }
-
-  .log {
-    font-size: 10px; color: var(--dim);
-    text-align: center; letter-spacing: 0.04em;
-    min-height: 14px; width: 100%;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 3px 8px;
-  }
-</style>
-</head>
-<body>
-
-<div class="portrait-warn">
-  <div class="icon">📱</div>
-  <strong>Handy drehen!</strong>
-  <p>Diese Steuerung ist für den<br>Querformat-Modus ausgelegt.</p>
-</div>
-
-<div class="app">
-
-  <div class="status-bar">
-    <div class="s-item">
-      <span class="conn-dot" id="conn-dot"></span>
-      <span class="s-label">WiFi</span>
-      <span class="s-val err" id="conn-status">Getrennt</span>
-    </div>
-    <div class="sep"></div>
-    <div class="s-item">
-      <span class="s-label">Akku</span>
-      <span class="s-val ok" id="battery">—</span>
-    </div>
-    <div class="sep"></div>
-    <div class="s-item">
-      <span class="s-label">Motoren</span>
-      <span class="s-val ok" id="motor-status">—</span>
-    </div>
-    <div class="sep"></div>
-    <input class="ip-input" id="ip-input" type="text" value="192.168.1.100" placeholder="ESP32 IP">
-    <button class="connect-btn" id="connect-btn">▶ Verbinden</button>
-  </div>
-
-  <div class="main">
-
-    <!-- LINKS: Höhe + Rotation -->
-    <div class="left-panel">
-      <span class="panel-label">Höhe</span>
-      <button class="btn tall disabled" id="up-btn">▲</button>
-      <button class="btn tall disabled" id="down-btn">▼</button>
-      <div class="vsep"></div>
-      <span class="panel-label">Rotation</span>
-      <div class="rot-row">
-        <button class="btn sm disabled" id="rotl-btn">↺</button>
-        <button class="btn sm disabled" id="rotr-btn">↻</button>
-      </div>
-    </div>
-
-    <!-- MITTE -->
-    <div class="center-panel">
-      <div class="tele">
-        <div class="tele-card">
-          <div class="tele-val" id="alt-display">0 m</div>
-          <div class="tele-key">Höhe</div>
-        </div>
-        <div class="tele-card">
-          <div class="tele-val" id="speed-display">0 km/h</div>
-          <div class="tele-key">Geschw.</div>
-        </div>
-        <div class="tele-card">
-          <div class="tele-val" id="heading-display">0°</div>
-          <div class="tele-key">Richtung</div>
-        </div>
-      </div>
-
-      <div class="console-wrap">
-        <div class="console-header">
-          <span class="console-title">⬢ WebSocket Monitor</span>
-          <button class="console-clear" id="clear-btn">CLEAR</button>
-        </div>
-        <div class="console-log" id="console-log"></div>
-      </div>
-
-      <button class="shutdown-btn" id="shutdown-btn" disabled>
-        <span class="stop-sq"></span>
-        <span id="shutdown-label">Motoren AUS</span>
-      </button>
-      <div class="log" id="log">Nicht verbunden — IP eingeben und verbinden</div>
-    </div>
-
-    <!-- RECHTS: Richtung -->
-    <div class="right-panel">
-      <span class="panel-label">Richtung</span>
-      <div class="dpad">
-        <div class="ghost"></div>
-        <button class="btn disabled" id="fwd-btn">▲</button>
-        <div class="ghost"></div>
-        <button class="btn disabled" id="left-btn">◀</button>
-        <div class="ghost"><span class="stop-lbl">STOP</span></div>
-        <button class="btn disabled" id="right-btn">▶</button>
-        <div class="ghost"></div>
-        <button class="btn disabled" id="back-btn">▼</button>
-        <div class="ghost"></div>
-      </div>
-    </div>
-
-  </div>
-</div>
-
-<script>
-(function () {
-  'use strict';
-
-  document.addEventListener('contextmenu', function (e) { e.preventDefault(); }, { passive: false });
-
-  // ── State ─────────────────────────────────────────────────────────────────
-  var state = {
-    alt: 0, speed: 0, heading: 0,
-    motors: false,
-    active: null,
-    interval: null,
-    connected: false,
-    ws: null,
-  };
-
-  var cmds = {
-    fwd:   { label: 'Vorwärts',  cmd: 'FWD',   speed: 12 },
-    back:  { label: 'Rückwärts', cmd: 'BACK',  speed: 8  },
-    left:  { label: 'Links',     cmd: 'LEFT',  speed: 6  },
-    right: { label: 'Rechts',    cmd: 'RIGHT', speed: 6  },
-    up:    { label: 'Steigen',   cmd: 'UP',    alt: 1    },
-    down:  { label: 'Sinken',    cmd: 'DOWN',  alt: -1   },
-    rotl:  { label: 'Drehen L',  cmd: 'ROTL',  rot: -6   },
-    rotr:  { label: 'Drehen R',  cmd: 'ROTR',  rot: 6    },
-  };
-
-  var ALL_BTNS = ['fwd','back','left','right','up','down','rotl','rotr'];
-
-  // ── Console log ───────────────────────────────────────────────────────────
-  function consoleLog(msg, type) {
-    var el = document.getElementById('console-log');
-    var line = document.createElement('div');
-    line.className = 'log-line ' + (type || '');
-    var ts = new Date().toLocaleTimeString('de', { hour12: false });
-    line.textContent = '[' + ts + '] ' + msg;
-    el.appendChild(line);
-    el.scrollTop = el.scrollHeight;
-    while (el.children.length > 200) el.removeChild(el.firstChild);
-  }
-
-  document.getElementById('clear-btn').addEventListener('click', function () {
-    document.getElementById('console-log').innerHTML = '';
-  });
-
-  // ── Connect / Disconnect ──────────────────────────────────────────────────
-  document.getElementById('connect-btn').addEventListener('click', function () {
-    if (state.connected) {
-      disconnectWS();
-    } else {
-      connectWS();
-    }
-  });
-
-  function connectWS() {
-    var ip = document.getElementById('ip-input').value.trim();
-    if (!ip) { consoleLog('Keine IP eingegeben', 'err'); return; }
-
-    var url = 'ws://' + ip + '/ws';
-    consoleLog('Verbinde mit ' + url + ' ...', 'sys');
-
-    try {
-      state.ws = new WebSocket(url);
-    } catch (e) {
-      consoleLog('WebSocket Fehler: ' + e.message, 'err');
-      return;
-    }
-
-    state.ws.onopen = function () {
-      state.connected = true;
-      setConnected(true);
-      consoleLog('Verbunden mit ESP32 @ ' + ip, 'sys');
-      setLog('Verbunden — Motoren aktivieren');
-    };
-
-    state.ws.onclose = function () {
-      if (state.connected) {
-        consoleLog('Verbindung getrennt', 'sys');
-        disconnectWS();
-      }
-    };
-
-    state.ws.onerror = function () {
-      consoleLog('WebSocket Fehler — IP korrekt?', 'err');
-      setLog('Verbindungsfehler');
-      disconnectWS();
-    };
-
-    state.ws.onmessage = function (e) {
-      consoleLog('← ' + e.data, 'rx');
-      parseESPMsg(e.data);
-    };
-  }
-
-  function disconnectWS() {
-    state.connected = false;
-    stopCmd();
-    setConnected(false);
-    if (state.ws) {
-      state.ws.onclose = null; // verhindere Rekursion
-      state.ws.close();
-      state.ws = null;
-    }
-    consoleLog('Verbindung getrennt', 'sys');
-    setLog('Getrennt');
-  }
-
-  // ── ESP32 Nachrichten parsen ───────────────────────────────────────────────
-  function parseESPMsg(line) {
-    if (line.startsWith('BATT:')) {
-      var b = parseInt(line.split(':')[1]);
-      if (!isNaN(b)) {
-        var el = document.getElementById('battery');
-        el.textContent = b + '%';
-        el.className = 's-val' + (b < 20 ? ' err' : b < 40 ? ' warn' : ' ok');
-      }
-    } else if (line.startsWith('ALT:')) {
-      var a = parseInt(line.split(':')[1]);
-      if (!isNaN(a)) { state.alt = a; updateTele(); }
-    }
-  }
-
-  // ── Senden ────────────────────────────────────────────────────────────────
-  function send(str) {
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      state.ws.send(str);
-      consoleLog('→ ' + str.trim(), 'tx');
-    }
-  }
-
-  // ── UI State ──────────────────────────────────────────────────────────────
-  function setConnected(connected) {
-    var dot   = document.getElementById('conn-dot');
-    var label = document.getElementById('conn-status');
-    var btn   = document.getElementById('connect-btn');
-    var ms    = document.getElementById('motor-status');
-    var sdBtn = document.getElementById('shutdown-btn');
-
-    if (connected) {
-      dot.classList.add('connected');
-      label.textContent = 'Verbunden';
-      label.className = 's-val ok';
-      btn.textContent = '■ Trennen';
-      btn.classList.add('connected');
-      ms.textContent = 'Bereit';
-      ms.className = 's-val warn';
-      sdBtn.disabled = false;
-    } else {
-      dot.classList.remove('connected');
-      label.textContent = 'Getrennt';
-      label.className = 's-val err';
-      btn.textContent = '▶ Verbinden';
-      btn.classList.remove('connected');
-      ms.textContent = '—';
-      ms.className = 's-val';
-      sdBtn.disabled = true;
-      state.motors = false;
-      document.getElementById('shutdown-btn').classList.remove('on');
-      document.getElementById('shutdown-label').textContent = 'Motoren AUS';
-      disableControls();
-    }
-  }
-
-  function enableControls() {
-    ALL_BTNS.forEach(function (id) {
-      var el = document.getElementById(id + '-btn');
-      if (el) el.classList.remove('disabled');
-    });
-  }
-
-  function disableControls() {
-    ALL_BTNS.forEach(function (id) {
-      var el = document.getElementById(id + '-btn');
-      if (el) { el.classList.add('disabled'); el.classList.remove('pressed'); }
-    });
-  }
-
-  // ── Button Controls ───────────────────────────────────────────────────────
-  ALL_BTNS.forEach(function (id) {
-    var el = document.getElementById(id + '-btn');
-    if (!el) return;
-    el.addEventListener('touchstart',  function (e) { e.preventDefault(); startCmd(id); }, { passive: false });
-    el.addEventListener('touchend',    function (e) { e.preventDefault(); stopCmd(); },    { passive: false });
-    el.addEventListener('touchcancel', function (e) { e.preventDefault(); stopCmd(); },    { passive: false });
-    el.addEventListener('pointerdown',  function (e) { if (e.pointerType !== 'touch') startCmd(id); });
-    el.addEventListener('pointerup',    function (e) { if (e.pointerType !== 'touch') stopCmd(); });
-    el.addEventListener('pointerleave', function (e) { if (e.pointerType !== 'touch') stopCmd(); });
-    el.addEventListener('selectstart',  function (e) { e.preventDefault(); });
-  });
-
-  var shutEl = document.getElementById('shutdown-btn');
-  shutEl.addEventListener('touchstart', function (e) { e.preventDefault(); }, { passive: false });
-  shutEl.addEventListener('touchend',   function (e) { e.preventDefault(); toggleShutdown(); }, { passive: false });
-  shutEl.addEventListener('click',      function ()  { if (!('ontouchstart' in window)) toggleShutdown(); });
-
-  function startCmd(cmd) {
-    if (!state.motors || !state.connected) return;
-    if (document.getElementById(cmd + '-btn').classList.contains('disabled')) return;
-    stopCmd();
-    state.active = cmd;
-    var el = document.getElementById(cmd + '-btn');
-    if (el) el.classList.add('pressed');
-    setLog(cmds[cmd].label + ' ...');
-    send(cmds[cmd].cmd);
-    tick(cmd);
-    state.interval = setInterval(function () {
-      tick(cmd);
-      send(cmds[cmd].cmd);
-    }, 120);
-  }
-
-  function stopCmd() {
-    if (state.active) {
-      var el = document.getElementById(state.active + '-btn');
-      if (el) el.classList.remove('pressed');
-    }
-    clearInterval(state.interval);
-    state.interval = null;
-    state.active = null;
-    state.speed = 0;
-    updateTele();
-    if (state.connected) {
-      send('STOP');
-      if (state.motors) setLog('Bereit');
-    }
-  }
-
-  function tick(cmd) {
-    var c = cmds[cmd];
-    if (c.alt   !== undefined) { state.alt     = Math.max(0, Math.min(120, state.alt + c.alt)); state.speed = 3; }
-    if (c.speed !== undefined) { state.speed   = c.speed; }
-    if (c.rot   !== undefined) { state.heading = ((state.heading + c.rot) % 360 + 360) % 360; }
-    updateTele();
-  }
-
-  function updateTele() {
-    document.getElementById('alt-display').textContent     = state.alt     + ' m';
-    document.getElementById('speed-display').textContent   = state.speed   + ' km/h';
-    document.getElementById('heading-display').textContent = state.heading + '°';
-  }
-
-  function toggleShutdown() {
-    if (!state.connected) return;
-    state.motors = !state.motors;
-    stopCmd();
-    var btn = document.getElementById('shutdown-btn');
-    var lbl = document.getElementById('shutdown-label');
-    var ms  = document.getElementById('motor-status');
-    if (!state.motors) {
-      btn.classList.add('on');
-      lbl.textContent = 'Motoren EIN';
-      ms.textContent  = 'Gestoppt';
-      ms.className    = 's-val err';
-      state.alt = 0; state.speed = 0;
-      updateTele();
-      setLog('⚠ Motoren gestoppt');
-      send('MOTORS_OFF');
-      disableControls();
-    } else {
-      btn.classList.remove('on');
-      lbl.textContent = 'Motoren AUS';
-      ms.textContent  = 'Aktiv';
-      ms.className    = 's-val ok';
-      setLog('Motoren aktiv — Bereit');
-      send('MOTORS_ON');
-      enableControls();
-    }
-  }
-
-  function setLog(msg) { document.getElementById('log').textContent = msg; }
-
-})();
-</script>
-</body>
-</html>
+}
